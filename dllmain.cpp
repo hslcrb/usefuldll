@@ -1,4 +1,4 @@
-﻿#// UsefulDLL - 유틸리티 DLL
+﻿// UsefulDLL - 유틸리티 DLL
 // Library name: UsefulDLL
 // 설명: 범용으로 사용 가능한 가벼운 유틸리티 기능을 제공하는 DLL
 // Description: A lightweight utility DLL providing small, broadly useful functions
@@ -10,9 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <vector>
-#include <sstream>
-#include <iomanip>
+#include <mutex>
 
 // DllMain: DLL 진입점 — 프로세스/스레드 연결과 해제를 처리합니다.
 // DllMain: DLL entry point — handles process/thread attach and detach notifications.
@@ -76,27 +74,44 @@ __declspec(dllexport) int WINAPI ReverseStringA(const char* input, char* output,
         return (int)needed;
     if (outputSize < needed)
         return (int)needed;
-    for (size_t i = 0; i < len; ++i)
-        output[i] = input[len - 1 - i];
-    output[len] = '\0';
+    // If caller provided the same buffer for input and output, reverse in-place to avoid extra memory movement.
+    if (output == input) {
+        char* s = reinterpret_cast<char*>(output);
+        size_t i = 0, j = (len == 0 ? 0 : len - 1);
+        while (i < j) {
+            char tmp = s[i];
+            s[i] = s[j];
+            s[j] = tmp;
+            ++i; --j;
+        }
+        return (int)needed;
+    }
+    // Copy reversed using pointers for minimal overhead
+    const char* p = input + len;
+    char* o = output;
+    while (p != input) {
+        --p;
+        *o++ = *p;
+    }
+    *o = '\0';
     return (int)needed;
 }
 
 // CRC32 테이블과 초기화
 // CRC32 table and initializer (IEEE 802.3 polynomial)
 static uint32_t crc32_table[256];
+static std::once_flag crc32_init_flag;
 static void init_crc32_table()
 {
-    static bool inited = false;
-    if (inited) return;
-    const uint32_t poly = 0xEDB88320u;
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
-        for (int j = 0; j < 8; ++j)
-            crc = (crc >> 1) ^ ((crc & 1) ? poly : 0);
-        crc32_table[i] = crc;
-    }
-    inited = true;
+    std::call_once(crc32_init_flag, [](){
+        const uint32_t poly = 0xEDB88320u;
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t crc = i;
+            for (int j = 0; j < 8; ++j)
+                crc = (crc >> 1) ^ ((crc & 1) ? poly : 0);
+            crc32_table[i] = crc;
+        }
+    });
 }
 
 // ComputeCRC32
@@ -108,8 +123,11 @@ __declspec(dllexport) uint32_t WINAPI ComputeCRC32(const void* data, size_t len)
     init_crc32_table();
     uint32_t crc = 0xFFFFFFFFu;
     const unsigned char* p = (const unsigned char*)data;
-    for (size_t i = 0; i < len; ++i)
-        crc = (crc >> 8) ^ crc32_table[(crc ^ p[i]) & 0xFFu];
+    const uint32_t* table = crc32_table;
+    // Process byte-by-byte with a tight loop
+    while (len--) {
+        crc = (crc >> 8) ^ table[(crc ^ *p++) & 0xFFu];
+    }
     return crc ^ 0xFFFFFFFFu;
 }
 
@@ -126,21 +144,30 @@ __declspec(dllexport) int WINAPI Base64Encode(const unsigned char* data, size_t 
     size_t needed = ((dataLen + 2) / 3) * 4 + 1;
     if (!out) return (int)needed;
     if (outSize < needed) return (int)needed;
-    size_t oi = 0;
-    for (size_t i = 0; i < dataLen; i += 3) {
-        uint32_t val = data[i] << 16;
-        if (i + 1 < dataLen) val |= data[i+1] << 8;
-        if (i + 2 < dataLen) val |= data[i+2];
-        int idx0 = (val >> 18) & 0x3F;
-        int idx1 = (val >> 12) & 0x3F;
-        int idx2 = (val >> 6) & 0x3F;
-        int idx3 = val & 0x3F;
-        out[oi++] = b64_chars[idx0];
-        out[oi++] = b64_chars[idx1];
-        out[oi++] = (i + 1 < dataLen) ? b64_chars[idx2] : '=';
-        out[oi++] = (i + 2 < dataLen) ? b64_chars[idx3] : '=';
+    const unsigned char* p = data;
+    const unsigned char* pend = data + dataLen;
+    char* o = out;
+    // Process full 3-byte blocks
+    size_t full = dataLen / 3;
+    for (size_t i = 0; i < full; ++i) {
+        uint32_t val = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+        *o++ = b64_chars[(val >> 18) & 0x3F];
+        *o++ = b64_chars[(val >> 12) & 0x3F];
+        *o++ = b64_chars[(val >> 6) & 0x3F];
+        *o++ = b64_chars[val & 0x3F];
+        p += 3;
     }
-    out[oi] = '\0';
+    // Tail
+    size_t rem = pend - p;
+    if (rem) {
+        uint32_t val = (uint32_t)p[0] << 16;
+        if (rem == 2) val |= (uint32_t)p[1] << 8;
+        *o++ = b64_chars[(val >> 18) & 0x3F];
+        *o++ = b64_chars[(val >> 12) & 0x3F];
+        *o++ = (rem == 2) ? b64_chars[(val >> 6) & 0x3F] : '=';
+        *o++ = '=';
+    }
+    *o = '\0';
     return (int)needed;
 }
 
@@ -169,19 +196,22 @@ __declspec(dllexport) int WINAPI Base64Decode(const char* in, unsigned char* out
     if (inLen >= 2 && in[inLen-2] == '=') --expected;
     if (!out) return (int)expected;
     if (outSize < expected) return (int)expected;
-    size_t oi = 0;
-    for (size_t i = 0; i < inLen; i += 4) {
-        int v0 = b64_index(in[i]);
-        int v1 = b64_index(in[i+1]);
-        int v2 = (in[i+2] == '=') ? -2 : b64_index(in[i+2]);
-        int v3 = (in[i+3] == '=') ? -2 : b64_index(in[i+3]);
+    const char* p = in;
+    const char* pend = in + inLen;
+    unsigned char* o = out;
+    while (p < pend) {
+        int v0 = b64_index(p[0]);
+        int v1 = b64_index(p[1]);
+        int v2 = (p[2] == '=') ? -2 : b64_index(p[2]);
+        int v3 = (p[3] == '=') ? -2 : b64_index(p[3]);
         if (v0 < 0 || v1 < 0 || (v2 < -1) || (v3 < -1)) return -1;
         uint32_t val = (v0 << 18) | (v1 << 12);
         if (v2 >= 0) val |= (v2 << 6);
         if (v3 >= 0) val |= v3;
-        out[oi++] = (val >> 16) & 0xFF;
-        if (v2 >= 0) out[oi++] = (val >> 8) & 0xFF;
-        if (v3 >= 0) out[oi++] = val & 0xFF;
+        *o++ = (val >> 16) & 0xFF;
+        if (v2 >= 0) *o++ = (val >> 8) & 0xFF;
+        if (v3 >= 0) *o++ = val & 0xFF;
+        p += 4;
     }
     return (int)expected;
 }
@@ -193,23 +223,23 @@ __declspec(dllexport) int WINAPI Base64Decode(const char* in, unsigned char* out
 // Return: required length (including null) or -1 on error
 __declspec(dllexport) int WINAPI GetUsefulDllSystemInfo(char* buffer, size_t bufferSize)
 {
-    std::ostringstream ss;
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    ss << "Arch=";
+    const char* arch = "Unknown";
     switch (si.wProcessorArchitecture) {
-    case PROCESSOR_ARCHITECTURE_AMD64: ss << "x64"; break;
-    case PROCESSOR_ARCHITECTURE_INTEL: ss << "x86"; break;
-    case PROCESSOR_ARCHITECTURE_ARM: ss << "ARM"; break;
-    case PROCESSOR_ARCHITECTURE_ARM64: ss << "ARM64"; break;
-    default: ss << "Unknown"; break;
+    case PROCESSOR_ARCHITECTURE_AMD64: arch = "x64"; break;
+    case PROCESSOR_ARCHITECTURE_INTEL: arch = "x86"; break;
+    case PROCESSOR_ARCHITECTURE_ARM: arch = "ARM"; break;
+    case PROCESSOR_ARCHITECTURE_ARM64: arch = "ARM64"; break;
+    default: arch = "Unknown"; break;
     }
-    ss << "; Cores=" << si.dwNumberOfProcessors;
-    std::string s = ss.str();
-    size_t needed = s.size() + 1;
+    char temp[64];
+    int n = sprintf_s(temp, sizeof(temp), "%s; Cores=%u", arch, (unsigned)si.dwNumberOfProcessors);
+    if (n < 0) return -1;
+    size_t needed = (size_t)n + 1;
     if (!buffer) return (int)needed;
     if (bufferSize < needed) return (int)needed;
-    memcpy(buffer, s.c_str(), needed);
+    memcpy(buffer, temp, needed);
     return (int)needed;
 }
 
