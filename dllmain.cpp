@@ -5,12 +5,25 @@
 // dllmain.cpp : DLL 애플리케이션의 진입점을 정의합니다. (한/영)
 #include "pch.h"
 #include <windows.h>
-#include <cstdint>
-#include <cstddef>
-#include <cstdio>
-#include <cstring>
-#include <string>
-#include <mutex>
+#include <stdio.h>
+
+// 최소한의 C 스타일 유틸리티 구현: stdio.h 기반으로 동작하도록 의존성 최소화
+// Minimal C-style helpers to avoid relying on additional headers
+static unsigned int my_strlen(const char* s)
+{
+    const char* p = s;
+    while (*p) ++p;
+    return (unsigned int)(p - s);
+}
+
+static void* my_memcpy(void* dest, const void* src, size_t n)
+{
+    unsigned char* d = (unsigned char*)dest;
+    const unsigned char* s = (const unsigned char*)src;
+    while (n--) *d++ = *s++;
+    return dest;
+}
+
 
 // DllMain: DLL 진입점 — 프로세스/스레드 연결과 해제를 처리합니다.
 // DllMain: DLL entry point — handles process/thread attach and detach notifications.
@@ -50,12 +63,10 @@ __declspec(dllexport) int WINAPI GetUsefulDllVersion()
 __declspec(dllexport) int WINAPI GetUsefulDllGreeting(char* buffer, size_t bufferSize)
 {
     const char* msg = "UsefulDLL v1.00 - lightweight utility DLL";
-    size_t needed = strlen(msg) + 1;
-    if (!buffer)
-        return (int)needed;
-    if (bufferSize < needed)
-        return (int)needed;
-    memcpy(buffer, msg, needed);
+    unsigned int needed = my_strlen(msg) + 1;
+    if (!buffer) return (int)needed;
+    if (bufferSize < needed) return (int)needed;
+    my_memcpy(buffer, msg, needed);
     return (int)needed;
 }
 
@@ -68,8 +79,8 @@ __declspec(dllexport) int WINAPI ReverseStringA(const char* input, char* output,
 {
     if (!input)
         return -1;
-    size_t len = strlen(input);
-    size_t needed = len + 1;
+    unsigned int len = my_strlen(input);
+    unsigned int needed = len + 1;
     if (!output)
         return (int)needed;
     if (outputSize < needed)
@@ -97,36 +108,67 @@ __declspec(dllexport) int WINAPI ReverseStringA(const char* input, char* output,
     return (int)needed;
 }
 
-// CRC32 테이블과 초기화
-// CRC32 table and initializer (IEEE 802.3 polynomial)
-static uint32_t crc32_table[256];
-static std::once_flag crc32_init_flag;
+// CRC32 테이블 및 slicing-by-8 초기화 (성능 향상)
+// CRC32 tables and slicing-by-8 initializer
+static unsigned int crc32_table[8][256];
+static volatile long crc_state = 0; // 0 = uninit, 1 = initializing, 2 = ready
 static void init_crc32_table()
 {
-    std::call_once(crc32_init_flag, [](){
-        const uint32_t poly = 0xEDB88320u;
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t crc = i;
-            for (int j = 0; j < 8; ++j)
-                crc = (crc >> 1) ^ ((crc & 1) ? poly : 0);
-            crc32_table[i] = crc;
+    // Attempt to become initializer
+    if (InterlockedCompareExchange(&crc_state, 1, 0) == 0) {
+        const unsigned int poly = 0xEDB88320u;
+        // table[0]
+        for (unsigned int i = 0; i < 256; ++i) {
+            unsigned int crc = i;
+            for (int j = 0; j < 8; ++j) crc = (crc >> 1) ^ ((crc & 1) ? poly : 0);
+            crc32_table[0][i] = crc;
         }
-    });
+        // Build slicing-by-8 tables
+        for (int t = 1; t < 8; ++t) {
+            for (unsigned int i = 0; i < 256; ++i) {
+                unsigned int v = crc32_table[t-1][i];
+                crc32_table[t][i] = (v >> 8) ^ crc32_table[0][v & 0xFFu];
+            }
+        }
+        // Mark ready
+        InterlockedExchange(&crc_state, 2);
+    } else {
+        // Wait until ready
+        while (crc_state != 2) {
+            Sleep(0);
+        }
+    }
 }
 
 // ComputeCRC32
 // 설명: 주어진 버퍼에 대해 CRC32(IEEE 802.3)를 계산하여 반환합니다.
 // Description: Computes CRC32 (IEEE 802.3) for the provided buffer and returns the checksum.
-__declspec(dllexport) uint32_t WINAPI ComputeCRC32(const void* data, size_t len)
+__declspec(dllexport) unsigned int WINAPI ComputeCRC32(const void* data, size_t len)
 {
     if (!data) return 0;
     init_crc32_table();
-    uint32_t crc = 0xFFFFFFFFu;
+    unsigned int crc = 0xFFFFFFFFu;
     const unsigned char* p = (const unsigned char*)data;
-    const uint32_t* table = crc32_table;
-    // Process byte-by-byte with a tight loop
+
+    // Use slicing-by-8 for higher throughput on large buffers
+    while (len >= 8) {
+        unsigned int a = (unsigned int)p[0] | ((unsigned int)p[1] << 8) | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+        unsigned int b = (unsigned int)p[4] | ((unsigned int)p[5] << 8) | ((unsigned int)p[6] << 16) | ((unsigned int)p[7] << 24);
+        crc ^= a;
+        crc = crc32_table[7][ crc        & 0xFFu ] ^
+              crc32_table[6][ (crc >> 8)  & 0xFFu ] ^
+              crc32_table[5][ (crc >> 16) & 0xFFu ] ^
+              crc32_table[4][ (crc >> 24) & 0xFFu ] ^
+              crc32_table[3][  b         & 0xFFu ] ^
+              crc32_table[2][ (b >> 8)   & 0xFFu ] ^
+              crc32_table[1][ (b >> 16)  & 0xFFu ] ^
+              crc32_table[0][ (b >> 24)  & 0xFFu ];
+        p += 8;
+        len -= 8;
+    }
+    // Process remaining bytes
     while (len--) {
-        crc = (crc >> 8) ^ table[(crc ^ *p++) & 0xFFu];
+        crc = (crc >> 8) ^ crc32_table[0][ (crc ^ *p++) & 0xFFu ];
     }
     return crc ^ 0xFFFFFFFFu;
 }
@@ -189,9 +231,9 @@ static inline int b64_index(char c)
 __declspec(dllexport) int WINAPI Base64Decode(const char* in, unsigned char* out, size_t outSize)
 {
     if (!in) return -1;
-    size_t inLen = strlen(in);
+    unsigned int inLen = my_strlen(in);
     if (inLen % 4 != 0) return -1;
-    size_t expected = (inLen / 4) * 3;
+    unsigned int expected = (inLen / 4) * 3;
     if (inLen >= 1 && in[inLen-1] == '=') --expected;
     if (inLen >= 2 && in[inLen-2] == '=') --expected;
     if (!out) return (int)expected;
@@ -205,12 +247,12 @@ __declspec(dllexport) int WINAPI Base64Decode(const char* in, unsigned char* out
         int v2 = (p[2] == '=') ? -2 : b64_index(p[2]);
         int v3 = (p[3] == '=') ? -2 : b64_index(p[3]);
         if (v0 < 0 || v1 < 0 || (v2 < -1) || (v3 < -1)) return -1;
-        uint32_t val = (v0 << 18) | (v1 << 12);
-        if (v2 >= 0) val |= (v2 << 6);
-        if (v3 >= 0) val |= v3;
-        *o++ = (val >> 16) & 0xFF;
-        if (v2 >= 0) *o++ = (val >> 8) & 0xFF;
-        if (v3 >= 0) *o++ = val & 0xFF;
+        unsigned int val = ( (unsigned int)v0 << 18 ) | ( (unsigned int)v1 << 12 );
+        if (v2 >= 0) val |= ((unsigned int)v2 << 6);
+        if (v3 >= 0) val |= (unsigned int)v3;
+        *o++ = (unsigned char)((val >> 16) & 0xFFu);
+        if (v2 >= 0) *o++ = (unsigned char)((val >> 8) & 0xFFu);
+        if (v3 >= 0) *o++ = (unsigned char)(val & 0xFFu);
         p += 4;
     }
     return (int)expected;
@@ -236,10 +278,10 @@ __declspec(dllexport) int WINAPI GetUsefulDllSystemInfo(char* buffer, size_t buf
     char temp[64];
     int n = sprintf_s(temp, sizeof(temp), "%s; Cores=%u", arch, (unsigned)si.dwNumberOfProcessors);
     if (n < 0) return -1;
-    size_t needed = (size_t)n + 1;
+    unsigned int needed = (unsigned int)n + 1u;
     if (!buffer) return (int)needed;
     if (bufferSize < needed) return (int)needed;
-    memcpy(buffer, temp, needed);
+    my_memcpy(buffer, temp, needed);
     return (int)needed;
 }
 
